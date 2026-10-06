@@ -1,0 +1,27 @@
+# Build artifacts
+_build/
+deps/
+doc/
+
+# Git
+.git/
+.gitignore
+
+# Test
+test/
+
+# Environment files with secrets
+.env
+
+# Temp files
+tmp/
+erl_crash.dump
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Specs & docs (not needed in image)
+specs/
+SPECS.md
+IMPLEMENTATION_PLAN.md

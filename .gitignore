@@ -1,0 +1,16 @@
+# Env
+.env
+
+# Dependencies
+/deps/
+/_build/
+
+# Generated on crash
+erl_crash.dump
+
+# Mix artifacts
+*.ez
+/doc/
+
+# Temp files
+/tmp/

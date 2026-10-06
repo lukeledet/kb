@@ -1,0 +1,1382 @@
+#!/usr/bin/env bash
+#
+# kb — command-line client for the KB knowledge base.
+#
+# Sends URLs, local PDFs/EPUBs, and text files to the KB HTTP API and returns
+# as soon as the work is queued, printing the command to check on it. Pass
+# --wait to poll to completion instead.
+#
+# Uses curl deliberately: on macOS, Local Network Privacy silently blocks
+# node/bun `fetch` to the LAN host, while Apple-signed curl gets through.
+#
+# Config (personal defaults can live in ~/.kbrc, sourced below if present):
+#   KB_URL   base URL of the KB service (default http://localhost:4000).
+#            Override per-invocation with --url.
+#
+# Requires: curl, jq.
+
+set -euo pipefail
+
+# ~/.kbrc is for personal values that don't belong in the repo, e.g.
+#   export KB_URL=http://kb.lan:4000
+if [ -f "$HOME/.kbrc" ]; then
+  . "$HOME/.kbrc"
+fi
+
+KB_URL="${KB_URL:-http://localhost:4000}"
+KB_URL="${KB_URL%/}"
+# what KB_URL was before any --url override, so the status hint only carries an
+# explicit KB_URL= prefix when it would otherwise point somewhere else
+KB_URL_AMBIENT="$KB_URL"
+PROG="$(basename "$0")"
+
+# ingest options (globals, filled by cmd_ingest)
+title=""
+tags=""
+metadata=""
+type="text"
+force="false"
+wait_for="false"
+timeout="600"
+
+die() {
+  printf '%s: %s\n' "$PROG" "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required dependency: $1"
+}
+
+usage() {
+  cat <<EOF
+$PROG — command-line client for the KB knowledge base
+
+Usage:
+  $PROG ingest <url|path> [options]   Ingest a URL, PDF/EPUB, or text file
+  $PROG search <query> [options]      Search the knowledge base
+  $PROG status <id>                   Show a source's ingestion status
+  $PROG content <id> [options]        Print a source's full text
+  $PROG rename <id> <title>           Rename a source
+  $PROG sync <dir> --collection <name> Sync a folder of documents into a collection
+  $PROG doc <collection> <key>        Print a document's stored text, byte for byte
+  $PROG links <collection> <key>      Show a page's backlinks and outlinks
+  $PROG links <collection> --report   Show broken links, orphans and ambiguous slugs
+  $PROG context <collection> [prefix] [description]
+                                      Show, set or clear (empty description) a context note
+  $PROG collection [name]             List collections, or show one's status
+  $PROG related <id> [options]        Sources closest in meaning to a source
+  $PROG related <collection> <key>    ... or to a document, by key
+  $PROG reindex <collection>          Re-chunk and re-embed a collection from stored text
+  $PROG relink <collection>           Rebuild a collection's wikilinks from stored text
+  $PROG meta <id> [json]              Show or merge a source's metadata
+  $PROG stats                         Show aggregate knowledge-base statistics
+  $PROG health                        Check that the KB service is reachable
+  $PROG help                          Show this help
+
+Ingest options:
+  -t, --title <title>   Title for the source (default: URL, or the filename)
+  -g, --tags  <a,b,c>   Comma-separated tags
+  -m, --metadata <json> JSON object of extra fields to store on the source
+      --type  <type>    For text files: text (default) or transcript
+  -f, --force           Re-ingest even if the content was already ingested
+      --wait            Poll until ingestion finishes instead of returning at queue time
+      --timeout <secs>  Max seconds to wait with --wait (default: $timeout)
+      --url <base>      KB base URL (default: \$KB_URL or http://localhost:4000)
+
+Search options:
+  -c, --collection <name>  Only search this collection, such as wiki or library
+  -d, --documents       One result per document, with a snippet (group_by document)
+  -g, --tags  <a,b,c>   Only search sources with any of these tags
+  -p, --prefix <key>    Only documents whose key starts with this, such as concepts/
+  -l, --limit <n>       Max results (default: 10)
+  -o, --offset <n>      Results to skip, for paging (default: 0)
+  -m, --mode  <mode>    hybrid (default), semantic, or keyword. Keyword takes
+                        "phrases", +required, -excluded and prefix* terms.
+      --no-rerank       Skip reranking (hybrid reranks by default)
+  -b, --budget <ms>     How long hybrid search may take, 500-5000 (default: 1450)
+      --type <a,b>      Only sources of these types: url, pdf, epub, text, transcript, markdown
+      --frontmatter <json>  Only documents whose frontmatter contains this, e.g. '{"type":"concept"}'
+      --since <date>    Only sources updated after this ISO 8601 date or timestamp
+      --threshold <f>   Minimum score for semantic mode (default: 0.0)
+      --json            Print the raw JSON response instead of a summary
+      --url <base>      KB base URL (default: \$KB_URL or http://localhost:4000)
+
+Related options:
+  -c, --collection <name>  Only return sources in this collection, e.g. library
+  -l, --limit <n>       Max related sources (default: 5, max: 50)
+      --json            Print the raw JSON response instead of a summary
+
+Content options:
+      --json            Print the raw JSON response instead of the bare text
+      --url <base>      KB base URL (default: \$KB_URL or http://localhost:4000)
+
+Sync options:
+  -c, --collection <name>  Collection to sync into (required)
+  -i, --include <globs>    Comma-separated globs of paths to sync, relative to
+                           <dir> (default: **/*.md). * stays within a folder,
+                           ** crosses folders.
+  -x, --exclude <globs>    Comma-separated globs of paths to leave out
+      --git-ref <ref>      Sync the files committed at <ref> (e.g. HEAD) instead
+                           of the working tree, so uncommitted edits stay out
+      --no-prune           Keep documents whose files are gone
+  -f, --force              Allow a prune that deletes over 20% of the collection
+      --dry-run            Show what would change, and change nothing
+      --timeout <secs>     Give up when indexing makes no progress for this
+                           long (default: 120)
+      --url <base>         KB base URL (default: \$KB_URL or http://localhost:4000)
+
+  Keys are paths relative to <dir>. Sync uploads only new and changed files,
+  renames moved ones without re-indexing, waits until everything is
+  searchable, then deletes documents whose files are gone. It exits non-zero
+  unless the collection ends up matching the files exactly, so running it
+  twice uploads nothing the second time.
+
+Doc options:
+      --section <heading>  Print only the section under this heading
+      --url <base>         KB base URL (default: \$KB_URL or http://localhost:4000)
+
+What gets sent where:
+  http(s):// URL   -> POST /api/ingest/url
+  .pdf / .epub     -> POST /api/ingest/file   (uploaded as multipart)
+  any other file   -> POST /api/ingest/text   (file contents as text)
+
+  Binary files are refused rather than ingested as text. Convert ebook formats
+  (.azw3/.mobi/.kfx) to .epub first — see the error message for a one-liner.
+
+Environment:
+  KB_URL   Base URL of the KB service. Current: $KB_URL
+
+Examples:
+  $PROG ingest https://example.com/post --tags web,elixir
+  $PROG ingest ~/Downloads/book.epub --title "Some Book" --tags book
+  $PROG ingest notes.md --type text --tags notes
+  $PROG ingest ~/Downloads/book.epub --wait
+  $PROG search "phoenix liveview streams" --tags elixir --limit 5
+  $PROG search functional programming --mode semantic
+  $PROG search "loop memory" --collection wiki --documents
+  $PROG search '"lethal trifecta" -openclaw' --mode keyword --documents
+  $PROG status 9cc4e998-e21e-4ab9-aae6-54ab8ece3cb4
+  $PROG content 9cc4e998-e21e-4ab9-aae6-54ab8ece3cb4
+  $PROG content 9cc4e998-e21e-4ab9-aae6-54ab8ece3cb4 > book.txt
+  $PROG rename 9cc4e998-e21e-4ab9-aae6-54ab8ece3cb4 "A better title"
+  $PROG ingest https://example.com/post --metadata '{"hn":"https://news.ycombinator.com/item?id=1"}'
+  $PROG meta 9cc4e998-e21e-4ab9-aae6-54ab8ece3cb4
+  $PROG meta 9cc4e998-e21e-4ab9-aae6-54ab8ece3cb4 '{"hn":"https://news.ycombinator.com/item?id=1"}'
+  $PROG meta 9cc4e998-e21e-4ab9-aae6-54ab8ece3cb4 '{"hn":null}'   # drop a key
+  $PROG stats
+  $PROG stats --json
+  $PROG sync ~/src/research --collection wiki --git-ref HEAD \\
+      --include 'sources/*.md,entities/*.md,concepts/*.md,analyses/*.md,overview.md'
+  $PROG sync ~/src/research -c wiki --include 'concepts/*.md' --no-prune --dry-run
+  $PROG doc wiki concepts/scrum.md
+  $PROG doc wiki concepts/scrum.md --section Details
+  $PROG links wiki concepts/comprehension-debt.md
+  $PROG links wiki --report
+  $PROG context wiki sources/ "One summary page per raw source"
+  $PROG context wiki "" "Research wiki: concepts, entities, sources, analyses"
+  $PROG context wiki sources/ ""        # clear it
+  $PROG collection wiki
+  $PROG related wiki concepts/comprehension-debt.md --collection library
+  $PROG search "agent memory" -c wiki -d --frontmatter '{"type":"concept"}' --since 2026-09-28
+EOF
+}
+
+# comma-separated string -> compact JSON array of trimmed, non-empty tags
+tags_json() {
+  jq -cn --arg s "$1" \
+    '$s | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))'
+}
+
+# JSON object string -> compact JSON, or {} when empty. Anything that is not a
+# JSON object is an error here: the server would quietly ignore it otherwise.
+# Call it as a bare assignment, not `local x="$(...)"` — `local` swallows the
+# non-zero status and the error would slip past `set -e`.
+metadata_json() {
+  local raw="$1"
+  if [[ -z "$raw" ]]; then
+    printf '{}'
+    return 0
+  fi
+  printf '%s' "$raw" | jq -ce 'if type == "object" then . else error("not an object") end' 2>/dev/null ||
+    die "metadata must be a JSON object, got: $raw"
+}
+
+lower_ext() {
+  printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]'
+}
+
+# True if the file looks binary (a NUL byte in the first 8KB). The text
+# endpoint would happily store the bytes and then embed gibberish, so we
+# refuse rather than silently ingesting junk.
+#
+# Detects NULs by stripping them and comparing byte counts: bash cannot hold a
+# NUL in a variable, so the obvious `grep -q $'\0'` is really `grep -q ''`,
+# which matches every file.
+looks_binary() {
+  local head_bytes raw stripped
+  head_bytes="$(LC_ALL=C head -c 8192 "$1" | LC_ALL=C tr -d '\000' | wc -c)"
+  stripped="${head_bytes//[[:space:]]/}"
+  raw="$(LC_ALL=C head -c 8192 "$1" | wc -c)"
+  raw="${raw//[[:space:]]/}"
+  [[ "$raw" != "$stripped" ]]
+}
+
+# The command to check on a source, as a single copy-pasteable line. Names the
+# program bare, assuming it is on PATH, rather than echoing back how it was
+# invoked.
+status_cmd() {
+  local id="$1"
+  [[ "$KB_URL" == "$KB_URL_AMBIENT" ]] || printf 'KB_URL=%s ' "$KB_URL"
+  printf '%s status %s\n' "$PROG" "$id"
+}
+
+# Split a "body\nHTTP_CODE" curl response and act on it: report the queued
+# source, honor dedup, and poll to completion only when --wait was given.
+handle_response() {
+  local resp="$1"
+  local code="${resp##*$'\n'}"
+  local body="${resp%$'\n'*}"
+  local id status err
+
+  id="$(printf '%s' "$body" | jq -r '.id // empty')"
+  status="$(printf '%s' "$body" | jq -r '.status // empty')"
+
+  case "$code" in
+    202)
+      echo "queued: $id ($status)"
+      ;;
+    200)
+      echo "already ingested: $id ($status) — use --force to re-ingest"
+      cmd_status "$id"
+      return 0
+      ;;
+    *)
+      err="$(printf '%s' "$body" | jq -r '.error // empty')"
+      die "server returned HTTP $code: ${err:-$body}"
+      ;;
+  esac
+
+  [[ -n "$id" ]] || die "no source id in response: $body"
+
+  if [[ "$wait_for" == "true" ]]; then
+    poll "$id"
+  else
+    status_cmd "$id"
+  fi
+}
+
+# Poll GET /api/sources/:id until the source completes, fails, or times out.
+poll() {
+  local id="$1"
+  local deadline=$((SECONDS + timeout))
+  local s status chunks err
+
+  printf 'ingesting'
+  while ((SECONDS < deadline)); do
+    sleep 3
+    s="$(curl -sS "$KB_URL/api/sources/$id")" || { echo; die "status check failed"; }
+    status="$(printf '%s' "$s" | jq -r '.status // "unknown"')"
+    case "$status" in
+      completed)
+        chunks="$(printf '%s' "$s" | jq -r '.chunk_count // 0')"
+        echo
+        echo "✓ completed: $id ($chunks chunks)"
+        return 0
+        ;;
+      failed)
+        err="$(printf '%s' "$s" | jq -r '.error // "unknown error"')"
+        echo
+        die "✗ failed: $id — $err"
+        ;;
+      *)
+        printf '.'
+        ;;
+    esac
+  done
+
+  echo
+  echo "still '$status' after ${timeout}s — check later:"
+  status_cmd "$id"
+}
+
+ingest_url() {
+  local url="$1" payload meta
+  meta="$(metadata_json "$metadata")"
+  payload="$(jq -cn \
+    --arg url "$url" \
+    --arg title "$title" \
+    --argjson tags "$(tags_json "$tags")" \
+    --argjson metadata "$meta" \
+    --argjson force "$force" \
+    '{url: $url, tags: $tags, metadata: $metadata, force: $force}
+       + (if $title == "" then {} else {title: $title} end)')"
+
+  local resp
+  resp="$(curl -sS -w $'\n%{http_code}' -X POST \
+    -H 'Content-Type: application/json' \
+    -d "$payload" \
+    "$KB_URL/api/ingest/url")" || die "request failed (is KB reachable at $KB_URL?)"
+
+  handle_response "$resp"
+}
+
+ingest_text_file() {
+  local path="$1" payload meta
+  [[ "$type" == "text" || "$type" == "transcript" ]] ||
+    die "--type must be 'text' or 'transcript', got '$type'"
+
+  local t="${title:-$(basename "$path")}"
+  meta="$(metadata_json "$metadata")"
+  payload="$(jq -cn \
+    --rawfile text "$path" \
+    --arg title "$t" \
+    --arg stype "$type" \
+    --argjson tags "$(tags_json "$tags")" \
+    --argjson metadata "$meta" \
+    --argjson force "$force" \
+    '{text: $text, source_type: $stype, title: $title, tags: $tags, metadata: $metadata, force: $force}')"
+
+  # Pipe the payload in on stdin: a large file passed as a -d argument blows
+  # past ARG_MAX ("Argument list too long") before curl ever runs.
+  local resp
+  resp="$(printf '%s' "$payload" | curl -sS -w $'\n%{http_code}' -X POST \
+    -H 'Content-Type: application/json' \
+    --data-binary @- \
+    "$KB_URL/api/ingest/text")" || die "request failed (is KB reachable at $KB_URL?)"
+
+  handle_response "$resp"
+}
+
+ingest_upload() {
+  local path="$1" ext="$2" ctype meta
+  case "$ext" in
+    pdf) ctype="application/pdf" ;;
+    epub) ctype="application/epub+zip" ;;
+    *) die "unsupported upload type: .$ext" ;;
+  esac
+
+  local t="${title:-$(basename "$path")}"
+  meta="$(metadata_json "$metadata")"
+
+  # curl's -F mis-parses filenames containing spaces, commas, or semicolons, and
+  # the server derives the type from the extension — so copy to a clean temp name.
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  cp "$path" "$tmpdir/upload.$ext"
+
+  local resp
+  resp="$(curl -sS -w $'\n%{http_code}' \
+    -F "file=@$tmpdir/upload.$ext;type=$ctype" \
+    -F "title=$t" \
+    -F "tags=$tags" \
+    -F "metadata=$meta" \
+    -F "force=$force" \
+    "$KB_URL/api/ingest/file")" || { rm -rf "$tmpdir"; die "request failed (is KB reachable at $KB_URL?)"; }
+  rm -rf "$tmpdir"
+
+  handle_response "$resp"
+}
+
+cmd_ingest() {
+  local target=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t | --title) title="${2:?--title needs a value}"; shift 2 ;;
+      -g | --tags) tags="${2:?--tags needs a value}"; shift 2 ;;
+      -m | --metadata) metadata="${2:?--metadata needs a value}"; shift 2 ;;
+      --type) type="${2:?--type needs a value}"; shift 2 ;;
+      -f | --force) force="true"; shift ;;
+      --wait) wait_for="true"; shift ;;
+      -w | --no-wait) wait_for="false"; shift ;;  # now the default; kept so old invocations work
+      --timeout) timeout="${2:?--timeout needs a value}"; shift 2 ;;
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (try '$PROG help')" ;;
+      *)
+        [[ -z "$target" ]] || die "unexpected extra argument: $1"
+        target="$1"; shift
+        ;;
+    esac
+  done
+
+  # anything after `--` is positional; we accept exactly one target
+  if [[ -z "$target" && $# -gt 0 ]]; then
+    target="$1"
+    shift
+  fi
+  [[ $# -eq 0 ]] || die "unexpected extra argument: $1"
+
+  [[ -n "$target" ]] || die "ingest: missing <url or path> (try '$PROG help')"
+
+  if [[ "$target" =~ ^https?:// ]]; then
+    ingest_url "$target"
+  elif [[ -f "$target" ]]; then
+    local ext
+    ext="$(lower_ext "$target")"
+    case "$ext" in
+      pdf | epub)
+        ingest_upload "$target" "$ext"
+        ;;
+      azw | azw3 | mobi | kfx)
+        die "unsupported format: .$ext — KB reads .pdf and .epub. Convert first:
+    uv run --with mobi --python 3.12 python -c \"import mobi;print(mobi.extract('$target')[1])\"
+  or, with Calibre installed: ebook-convert '$target' '${target%.*}.epub'"
+        ;;
+      *)
+        ! looks_binary "$target" ||
+          die "refusing to ingest '$target' as text: it looks like a binary file.
+  KB reads .pdf and .epub directly; anything else is sent as plain text."
+        ingest_text_file "$target"
+        ;;
+    esac
+  elif [[ -e "$target" ]]; then
+    die "not a regular file: $target"
+  else
+    die "no such file, and not an http(s) URL: $target"
+  fi
+}
+
+cmd_search() {
+  local query="" s_tags="" limit="" offset="" mode="" threshold="" raw="false"
+  local collection="" prefix="" group="chunk" rerank="" budget=""
+  local s_types="" frontmatter="" since=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c | --collection) collection="${2:?--collection needs a value}"; shift 2 ;;
+      -d | --documents) group="document"; shift ;;
+      -g | --tags) s_tags="${2:?--tags needs a value}"; shift 2 ;;
+      -p | --prefix) prefix="${2:?--prefix needs a value}"; shift 2 ;;
+      -l | --limit) limit="${2:?--limit needs a value}"; shift 2 ;;
+      -o | --offset) offset="${2:?--offset needs a value}"; shift 2 ;;
+      -m | --mode) mode="${2:?--mode needs a value}"; shift 2 ;;
+      --no-rerank) rerank="false"; shift ;;
+      -b | --budget) budget="${2:?--budget needs a value}"; shift 2 ;;
+      --type) s_types="${2:?--type needs a value}"; shift 2 ;;
+      --frontmatter) frontmatter="${2:?--frontmatter needs a value}"; shift 2 ;;
+      --since) since="${2:?--since needs a value}"; shift 2 ;;
+      --threshold) threshold="${2:?--threshold needs a value}"; shift 2 ;;
+      --json) raw="true"; shift ;;
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (try '$PROG help')" ;;
+      *) query="${query:+$query }$1"; shift ;;
+    esac
+  done
+  # bare words after `--` are part of the query too
+  while [[ $# -gt 0 ]]; do query="${query:+$query }$1"; shift; done
+
+  [[ -n "$query" ]] || die "search: missing <query> (try '$PROG help')"
+  case "$mode" in
+    "" | hybrid | semantic | keyword | fulltext) ;;
+    *) die "--mode must be hybrid, semantic, or keyword, got '$mode'" ;;
+  esac
+
+  # An empty frontmatter filter means none; anything else must be an object.
+  local fm_json="{}"
+  if [[ -n "$frontmatter" ]]; then
+    fm_json="$(printf '%s' "$frontmatter" | jq -ce 'if type == "object" then . else error("not an object") end' 2>/dev/null)" ||
+      die "--frontmatter must be a JSON object, got: $frontmatter"
+  fi
+
+  local payload
+  payload="$(jq -cn \
+    --arg query "$query" \
+    --argjson tags "$(tags_json "$s_tags")" \
+    --argjson types "$(tags_json "$s_types")" \
+    --argjson frontmatter "$fm_json" \
+    --arg since "$since" \
+    --arg mode "$mode" \
+    --arg limit "$limit" \
+    --arg offset "$offset" \
+    --arg threshold "$threshold" \
+    --arg collection "$collection" \
+    --arg prefix "$prefix" \
+    --arg group "$group" \
+    --arg rerank "$rerank" \
+    --arg budget "$budget" \
+    '{query: $query, tags: $tags, group_by: $group}
+       + (if $mode == "" then {} else {mode: $mode} end)
+       + (if $limit == "" then {} else {limit: ($limit | tonumber)} end)
+       + (if $offset == "" then {} else {offset: ($offset | tonumber)} end)
+       + (if $threshold == "" then {} else {threshold: ($threshold | tonumber)} end)
+       + (if $collection == "" then {} else {collection: $collection} end)
+       + (if $prefix == "" then {} else {key_prefix: $prefix} end)
+       + (if $rerank == "" then {} else {rerank: false} end)
+       + (if $budget == "" then {} else {latency_budget_ms: ($budget | tonumber)} end)
+       + (if ($types | length) == 0 then {} else {source_type: $types} end)
+       + (if ($frontmatter | length) == 0 then {} else {frontmatter: $frontmatter} end)
+       + (if $since == "" then {} else {updated_after: $since} end)')"
+
+  local resp code body
+  resp="$(curl -sS -w $'\n%{http_code}' -X POST \
+    -H 'Content-Type: application/json' \
+    -d "$payload" \
+    "$KB_URL/api/search")" || die "request failed (is KB reachable at $KB_URL?)"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+
+  [[ "$code" == "200" ]] ||
+    die "server returned HTTP $code: $(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null || printf '%s' "$body")"
+
+  if [[ "$raw" == "true" ]]; then
+    printf '%s' "$body" | jq .
+    return 0
+  fi
+
+  # Snippets mark matches with <mark>…</mark>; show them as *…* in a terminal.
+  printf '%s' "$body" | jq -r '
+    def mark: gsub("</?mark>"; "*");
+    def score: (.score * 1000 | round) / 1000;
+    "query: \"\(.query)\"  ·  mode: \(.mode)  ·  \(.total) result(s)  ·  \(.timings.total_ms) ms"
+      + (if .reranked then "  ·  reranked" else "" end)
+      + (if (.degraded | length) > 0 then "  ·  degraded: \(.degraded | join(", "))" else "" end),
+    ((.warnings // [])[] | "warning: \(.)"),
+    "",
+    if .group_by == "document" then
+      (.results[] |
+        "[\(score)]  \(.title)  ·  \(.collection)\(if .key then ":" + .key else "" end)",
+        (if (.heading_path | length) > 1 then "        § \(.heading_path | join(" > "))" else empty end),
+        (if .url then "        \(.url)" else empty end),
+        "        \(.snippet | mark)",
+        "")
+    else
+      (.results[] |
+        "[\(score)]  \(.source.title // "—")  ·  \(.source.collection // "?")\(if .source.key then ":" + .source.key else "" end)\(if (.source.tags | length) > 0 then "  ·  [\(.source.tags | join(", "))]" else "" end)",
+        (if .source.url then "        \(.source.url)" else empty end),
+        "        \((.snippet // .text) | mark | gsub("\\s+"; " ") | .[0:240])",
+        "")
+    end
+  '
+}
+
+cmd_status() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "status: missing <id>"
+  curl -sS "$KB_URL/api/sources/$id" | jq .
+}
+
+# Print a source's full text, as stored at ingest time. Streams the response
+# through a temp file rather than a shell variable: a book is megabytes of text,
+# and command substitution would hold all of it in memory and strip its newlines.
+cmd_content() {
+  local id="" raw="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) raw="true"; shift ;;
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (try '$PROG help')" ;;
+      *)
+        [[ -z "$id" ]] || die "unexpected extra argument: $1"
+        id="$1"; shift
+        ;;
+    esac
+  done
+  if [[ -z "$id" && $# -gt 0 ]]; then id="$1"; shift; fi
+  [[ $# -eq 0 ]] || die "unexpected extra argument: $1"
+
+  [[ -n "$id" ]] || die "content: missing <id> (try '$PROG help')"
+
+  local body code
+  body="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$body'" RETURN
+
+  code="$(curl -sS -o "$body" -w '%{http_code}' "$KB_URL/api/sources/$id/content")" ||
+    die "request failed (is KB reachable at $KB_URL?)"
+
+  [[ "$code" == "200" ]] ||
+    die "server returned HTTP $code: $(jq -r '.error // empty' "$body" 2>/dev/null || cat "$body")"
+
+  if [[ "$raw" == "true" ]]; then
+    jq . "$body"
+  else
+    jq -r '.content // empty' "$body"
+  fi
+}
+
+cmd_rename() {
+  local id="" title=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (try '$PROG help')" ;;
+      *)
+        if [[ -z "$id" ]]; then id="$1"
+        elif [[ -z "$title" ]]; then title="$1"
+        else die "unexpected extra argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "$title" && $# -gt 0 ]]; then title="$1"; shift; fi
+  [[ $# -eq 0 ]] || die "unexpected extra argument: $1"
+
+  [[ -n "$id" ]] || die "rename: missing <id> (try '$PROG help')"
+  [[ -n "$title" ]] || die "rename: missing <title> (try '$PROG help')"
+
+  local resp code body
+  resp="$(curl -sS -w $'\n%{http_code}' -X PATCH \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -cn --arg title "$title" '{title: $title}')" \
+    "$KB_URL/api/sources/$id")" || die "request failed (is KB reachable at $KB_URL?)"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+
+  [[ "$code" == "200" ]] ||
+    die "server returned HTTP $code: $(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null || printf '%s' "$body")"
+
+  printf 'renamed: %s -> %s\n' "$id" "$(printf '%s' "$body" | jq -r '.title')"
+}
+
+# Show a source's metadata, or merge a JSON object into it. Keys sent as null
+# are removed; keys left out are kept.
+cmd_meta() {
+  local id="" json=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (try '$PROG help')" ;;
+      *)
+        if [[ -z "$id" ]]; then id="$1"
+        elif [[ -z "$json" ]]; then json="$1"
+        else die "unexpected extra argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "$json" && $# -gt 0 ]]; then json="$1"; shift; fi
+  [[ $# -eq 0 ]] || die "unexpected extra argument: $1"
+
+  [[ -n "$id" ]] || die "meta: missing <id> (try '$PROG help')"
+
+  local resp code body
+  if [[ -z "$json" ]]; then
+    resp="$(curl -sS -w $'\n%{http_code}' "$KB_URL/api/sources/$id")" ||
+      die "request failed (is KB reachable at $KB_URL?)"
+  else
+    local meta
+    meta="$(metadata_json "$json")"
+    resp="$(curl -sS -w $'\n%{http_code}' -X PATCH \
+      -H 'Content-Type: application/json' \
+      -d "$(jq -cn --argjson metadata "$meta" '{metadata: $metadata}')" \
+      "$KB_URL/api/sources/$id")" || die "request failed (is KB reachable at $KB_URL?)"
+  fi
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+
+  [[ "$code" == "200" ]] ||
+    die "server returned HTTP $code: $(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null || printf '%s' "$body")"
+
+  printf '%s' "$body" | jq '.metadata'
+}
+
+cmd_stats() {
+  local raw="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) raw="true"; shift ;;
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      *) die "unknown option: $1 (try '$PROG help')" ;;
+    esac
+  done
+
+  local resp code body
+  resp="$(curl -sS -w $'\n%{http_code}' "$KB_URL/api/stats")" ||
+    die "request failed (is KB reachable at $KB_URL?)"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+
+  [[ "$code" == "200" ]] ||
+    die "server returned HTTP $code: $(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null || printf '%s' "$body")"
+
+  if [[ "$raw" == "true" ]]; then
+    printf '%s' "$body" | jq .
+    return 0
+  fi
+
+  printf '%s' "$body" | jq -r --arg url "$KB_URL" '
+    def kv: to_entries | map("\(.key) \(.value)") | join(", ");
+    "Knowledge base — \($url)",
+    "",
+    "Sources:  \(.total_sources) total",
+    "  status: \(if (.sources_by_status | length) > 0 then .sources_by_status | kv else "—" end)",
+    "  type:   \(if (.sources_by_type | length) > 0 then .sources_by_type | kv else "—" end)",
+    "Chunks:   \(.total_chunks) total across \(.chunked_sources) sources (avg \(.avg_chunks_per_source))",
+    "Tags:     \(.unique_tags) unique",
+    "Content:  \(.content_size) of indexed text",
+    "Storage:  \(.storage_size) on disk (data + indexes)",
+    (if (.sources_by_collection // {} | length) > 0 then "Collections: \(.sources_by_collection | kv)" else empty end),
+    (.search // {} | select((.searches // 0) > 0) |
+      "",
+      "Recent searches (since the last restart): \(.searches)  ·  \(.by_mode | kv)",
+      "  degraded: \((.degraded_share * 100 | round))%\(if (.degraded_by_reason | length) > 0 then " (\(.degraded_by_reason | kv))" else "" end)",
+      "  time:     total p50 \(.total_ms.p50) ms, p95 \(.total_ms.p95) ms\(if .rerank_ms.p50 then "  ·  rerank p50 \(.rerank_ms.p50) ms, p95 \(.rerank_ms.p95) ms" else "" end)",
+      (if (.query_embedding.winners | length) > 0 then "  query embedding won by: \(.query_embedding.winners | kv)" else empty end),
+      (.query_embedding.backends | to_entries[] |
+        "    \(.key): p50 \(.value.p50 // "—") ms, p95 \(.value.p95 // "—") ms, \(.value.attempts) attempts, \(.value.errors) errors"))
+  '
+}
+
+# ---------------------------------------------------------------------------
+# sync
+# ---------------------------------------------------------------------------
+
+# Glob -> anchored ERE. * and ? stay within one path segment, ** crosses
+# segments, and "**/" also matches no folder at all. Every other character is
+# literal, including [ and ].
+glob_regex() {
+  local g="$1" re="" c i n="${#1}"
+  for ((i = 0; i < n; i++)); do
+    c="${g:i:1}"
+    case "$c" in
+      '*')
+        if [[ "${g:i+1:1}" == "*" ]]; then
+          if [[ "${g:i+2:1}" == "/" ]]; then re+="(.*/)?"; ((i += 2)); else re+=".*"; ((i += 1)); fi
+        else
+          re+="[^/]*"
+        fi
+        ;;
+      '?') re+="[^/]" ;;
+      '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\') re+="\\$c" ;;
+      *) re+="$c" ;;
+    esac
+  done
+  printf '^%s$' "$re"
+}
+
+# Comma-separated globs -> one regex per line. Split with read, not an
+# unquoted expansion, so the shell never expands the globs itself.
+globs_to_regexes() {
+  local -a globs=()
+  local g
+  IFS=',' read -r -a globs <<<"$1"
+  for g in "${globs[@]}"; do
+    g="${g#"${g%%[![:space:]]*}"}"
+    g="${g%"${g##*[![:space:]]}"}"
+    [[ -n "$g" ]] && glob_regex "$g" && echo
+  done
+}
+
+matches_any() {
+  local path="$1" re
+  shift
+  for re in "$@"; do
+    [[ "$path" =~ $re ]] && return 0
+  done
+  return 1
+}
+
+# POST a JSON payload read from a file; sets RESP_CODE and RESP_BODY.
+post_json() {
+  local path="$1" payload_file="$2" out
+  out="$(curl -sS -w $'\n%{http_code}' -X POST \
+    -H 'Content-Type: application/json' \
+    --data-binary @"$payload_file" \
+    "$KB_URL$path")" || die "request failed (is KB reachable at $KB_URL?)"
+  RESP_CODE="${out##*$'\n'}"
+  RESP_BODY="${out%$'\n'*}"
+}
+
+api_error() {
+  printf '%s' "$RESP_BODY" | jq -r '.error // empty' 2>/dev/null || printf '%s' "$RESP_BODY"
+}
+
+# One sync per collection at a time. Two commits in quick succession each fire
+# a hook; holding the lock before resolving --git-ref means the later sync
+# reads the later commit, so an older tree can never land last.
+acquire_lock() {
+  local dir="$1" deadline=$((SECONDS + $2)) pid
+  while ! mkdir "$dir" 2>/dev/null; do
+    pid="$(cat "$dir/pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$dir"   # left by a sync that died
+      continue
+    fi
+    ((SECONDS < deadline)) || die "another sync of this collection is still running ($dir)"
+    sleep 1
+  done
+  echo $$ >"$dir/pid"
+}
+
+cmd_sync() {
+  local dir="" collection="" include="**/*.md" exclude="" git_ref="" prune="true"
+  local dry_run="false" force_prune="false" sync_timeout="120"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c | --collection) collection="${2:?--collection needs a value}"; shift 2 ;;
+      -i | --include) include="${2:?--include needs a value}"; shift 2 ;;
+      -x | --exclude) exclude="${2:?--exclude needs a value}"; shift 2 ;;
+      --git-ref) git_ref="${2:?--git-ref needs a value}"; shift 2 ;;
+      --no-prune) prune="false"; shift ;;
+      -f | --force) force_prune="true"; shift ;;
+      --dry-run) dry_run="true"; shift ;;
+      --timeout) sync_timeout="${2:?--timeout needs a value}"; shift 2 ;;
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (try '$PROG help')" ;;
+      *)
+        [[ -z "$dir" ]] || die "unexpected extra argument: $1"
+        dir="$1"; shift
+        ;;
+    esac
+  done
+  if [[ -z "$dir" && $# -gt 0 ]]; then dir="$1"; shift; fi
+  [[ $# -eq 0 ]] || die "unexpected extra argument: $1"
+
+  [[ -n "$dir" ]] || die "sync: missing <dir> (try '$PROG help')"
+  [[ -d "$dir" ]] || die "sync: not a directory: $dir"
+  [[ -n "$collection" ]] || die "sync: --collection is required"
+  [[ "$sync_timeout" =~ ^[0-9]+$ ]] || die "--timeout must be a whole number of seconds"
+  need shasum
+  need iconv
+
+  local work
+  work="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'" EXIT
+
+  acquire_lock "${TMPDIR:-/tmp}/kb-sync-$collection.lock" "$sync_timeout"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work' '${TMPDIR:-/tmp}/kb-sync-$collection.lock'" EXIT
+
+  local -a inc_res=() exc_res=()
+  local re
+  while IFS= read -r re; do [[ -n "$re" ]] && inc_res+=("$re"); done < <(globs_to_regexes "$include")
+  while IFS= read -r re; do [[ -n "$re" ]] && exc_res+=("$re"); done < <(globs_to_regexes "$exclude")
+  ((${#inc_res[@]} > 0)) || die "--include matched no patterns"
+
+  # 1. Collect the files, as keys relative to <dir>, with their bytes under
+  #    $work/files so both modes upload from the same place.
+  local files="$work/files" keys="$work/keys" key
+  mkdir -p "$files"
+  : >"$keys"
+
+  if [[ -n "$git_ref" ]]; then
+    git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || die "sync: $dir is not in a git repository"
+    local commit prefix top mode type oid path
+    commit="$(git -C "$dir" rev-parse --verify --quiet "$git_ref^{commit}")" ||
+      die "sync: unknown git ref: $git_ref"
+    prefix="$(git -C "$dir" rev-parse --show-prefix)"
+    top="$(git -C "$dir" rev-parse --show-toplevel)"
+    echo "syncing $dir at $git_ref (${commit:0:12}) into '$collection'"
+
+    # Read blobs raw with cat-file: no smudge filters, no line-ending changes,
+    # exactly the bytes in the commit. Symlinks and submodules are skipped.
+    while IFS= read -r -d '' line; do
+      read -r mode type oid <<<"${line%%$'\t'*}"
+      path="${line#*$'\t'}"
+      [[ "$type" == "blob" && "$mode" != "120000" ]] || continue
+      [[ "$path" == "$prefix"* ]] || continue
+      key="${path#"$prefix"}"
+      matches_any "$key" "${inc_res[@]}" || continue
+      ((${#exc_res[@]} == 0)) || ! matches_any "$key" "${exc_res[@]}" || continue
+      mkdir -p "$files/$(dirname "$key")"
+      git -C "$top" cat-file blob "$oid" >"$files/$key"
+      printf '%s\n' "$key" >>"$keys"
+    done < <(git -C "$top" ls-tree -r -z --full-tree "$commit")
+  else
+    echo "syncing $dir (working tree) into '$collection'"
+    local abs
+    abs="$(cd "$dir" && pwd -P)"
+    while IFS= read -r -d '' path; do
+      key="${path#"$abs"/}"
+      matches_any "$key" "${inc_res[@]}" || continue
+      ((${#exc_res[@]} == 0)) || ! matches_any "$key" "${exc_res[@]}" || continue
+      mkdir -p "$files/$(dirname "$key")"
+      cp "$path" "$files/$key"
+      printf '%s\n' "$key" >>"$keys"
+    done < <(find "$abs" -name .git -prune -o -type f -print0)
+  fi
+
+  local total
+  total="$(wc -l <"$keys" | tr -d ' ')"
+  # Matching nothing is almost always a wrong --include or <dir>, and with
+  # pruning on it would ask to empty the collection.
+  ((total > 0)) || die "sync: no files under $dir match --include '$include'"
+
+  # A key with a tab would corrupt the manifest below.
+  ! grep -q $'\t' "$keys" || die "sync: a file name contains a tab: $(grep $'\t' "$keys" | head -1)"
+
+  # 2. Hash every file in one shasum run and ask the KB what differs.
+  #    shasum prints "<64 hex>  <path>".
+  local manifest="$work/manifest.json"
+  if [[ -s "$keys" ]]; then
+    (cd "$files" && tr '\n' '\0' <"$keys" | xargs -0 shasum -a 256 --) |
+      sed -E 's/^([0-9a-f]{64})  /\1\t/' >"$work/hashes.tsv"
+  else
+    : >"$work/hashes.tsv"
+  fi
+
+  jq -R -s -c \
+    'split("\n") | map(select(length > 0) | split("\t") | {key: .[1], content_hash: .[0]})
+     | {manifest: .}' "$work/hashes.tsv" >"$manifest"
+
+  post_json "/api/collections/$collection/diff" "$manifest"
+  [[ "$RESP_CODE" == "200" ]] || die "diff failed: HTTP $RESP_CODE: $(api_error)"
+  local diff="$RESP_BODY"
+
+  local unchanged n_missing n_stale n_pending n_extra
+  unchanged="$(jq -r '.unchanged' <<<"$diff")"
+  n_missing="$(jq -r '.missing | length' <<<"$diff")"
+  n_stale="$(jq -r '.stale | length' <<<"$diff")"
+  n_pending="$(jq -r '.pending | length' <<<"$diff")"
+  n_extra="$(jq -r '.extra | length' <<<"$diff")"
+
+  # Renames only make sense when pruning: without it the old key must stay.
+  local renames='[]'
+  [[ "$prune" == "true" ]] && renames="$(jq -c '.renames' <<<"$diff")"
+
+  # Upload new and changed files. Pending ones already have this text queued,
+  # so the wait below covers them without sending them again.
+  local upload="$work/upload.txt"
+  jq -r --argjson renames "$renames" \
+    '($renames | map(.to)) as $to
+     | (.missing - $to) + .stale | .[]' <<<"$diff" >"$upload"
+
+  echo "$total files: $n_missing new, $n_stale changed, $n_pending indexing, $n_extra gone, $unchanged unchanged"
+
+  if [[ "$dry_run" == "true" ]]; then
+    jq -r --argjson renames "$renames" --arg prune "$prune" '
+      (.missing - ($renames | map(.to)) | map("  create  " + .)[]),
+      (.stale | map("  update  " + .)[]),
+      (.pending | map("  wait    " + .)[]),
+      ($renames | map("  rename  " + .from + " -> " + .to)[]),
+      (if $prune == "true" then (.extra - ($renames | map(.from)) | map("  delete  " + .)[]) else empty end)
+    ' <<<"$diff"
+    echo "dry run: nothing changed"
+    return 0
+  fi
+
+  # 3. Renames first: they carry indexed text over without embedding it again.
+  local renamed=0 from to
+  while IFS=$'\t' read -r from to; do
+    [[ -n "$from" ]] || continue
+    jq -cn --arg from "$from" --arg to "$to" '{from: $from, to: $to}' >"$work/rename.json"
+    post_json "/api/collections/$collection/rename" "$work/rename.json"
+    [[ "$RESP_CODE" == "200" ]] || die "rename $from -> $to failed: HTTP $RESP_CODE: $(api_error)"
+    renamed=$((renamed + 1))
+  done < <(jq -r '.[] | [.from, .to] | @tsv' <<<"$renames")
+
+  # 4. Upload in batches of up to 50 files or about 1 MB.
+  local created=0 updated=0 errors=0 batch_n=0 batch_bytes=0 size
+  local -a batch_args=()
+
+  flush_batch() {
+    ((batch_n > 0)) || return 0
+    local i filter="[" out
+    for ((i = 0; i < batch_n; i++)); do
+      filter+="{key: \$k$i, content: \$c$i},"
+    done
+    filter="${filter%,}] | {documents: .}"
+    jq -n "${batch_args[@]}" "$filter" >"$work/batch.json"
+    post_json "/api/collections/$collection/documents" "$work/batch.json"
+    [[ "$RESP_CODE" == "200" ]] || die "upload failed: HTTP $RESP_CODE: $(api_error)"
+    out="$(jq -r '[.counts.created // 0, .counts.updated // 0, .counts.retried // 0, .errors] | @tsv' <<<"$RESP_BODY")"
+    local c u r e
+    IFS=$'\t' read -r c u r e <<<"$out"
+    created=$((created + c))
+    updated=$((updated + u + r))
+    errors=$((errors + e))
+    jq -r '.results[] | select(.error) | "  error   \(.key): \(.error)"' <<<"$RESP_BODY" >&2
+    batch_n=0
+    batch_bytes=0
+    batch_args=()
+  }
+
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    # Invalid UTF-8 would be rewritten on its way through JSON, so its hash
+    # would never match and it would upload on every sync.
+    iconv -f UTF-8 -t UTF-8 "$files/$key" >/dev/null 2>&1 || die "sync: not valid UTF-8: $key"
+    size="$(wc -c <"$files/$key" | tr -d ' ')"
+    if ((batch_n > 0 && (batch_n >= 50 || batch_bytes + size > 1000000))); then
+      flush_batch
+    fi
+    batch_args+=(--arg "k$batch_n" "$key" --rawfile "c$batch_n" "$files/$key")
+    batch_n=$((batch_n + 1))
+    batch_bytes=$((batch_bytes + size))
+  done <"$upload"
+  flush_batch
+
+  local n_upload
+  n_upload="$(grep -c . "$upload" || true)"
+  ((n_upload == 0)) || echo "uploaded $n_upload file(s), waiting for them to index"
+
+  # 5. Wait until nothing is left indexing, then prune and confirm. The last
+  #    diff is the check that the collection matches the files exactly. The
+  #    timeout counts from the last progress, so a large first sync keeps
+  #    going while a stuck one gives up.
+  local deadline=$((SECONDS + sync_timeout)) prune_flag="$prune" left last=-1
+  jq -c --argjson prune false '. + {prune: $prune}' "$manifest" >"$work/check.json"
+  while :; do
+    post_json "/api/collections/$collection/diff" "$work/check.json"
+    [[ "$RESP_CODE" == "200" ]] || die "diff failed: HTTP $RESP_CODE: $(api_error)"
+    left="$(jq -r '.pending | length' <<<"$RESP_BODY")"
+    ((left > 0)) || break
+    if ((last < 0 || left < last)); then
+      deadline=$((SECONDS + sync_timeout))
+      last="$left"
+    fi
+    ((SECONDS < deadline)) || break
+    sleep 2
+  done
+
+  jq -c --argjson prune "$prune_flag" --argjson force "$force_prune" \
+    '. + {prune: $prune, force: $force}' "$manifest" >"$work/final.json"
+  post_json "/api/collections/$collection/diff" "$work/final.json"
+  if [[ "$RESP_CODE" == "409" ]]; then
+    die "$(api_error) (rerun with --force, or check --include)"
+  fi
+  [[ "$RESP_CODE" == "200" ]] || die "final diff failed: HTTP $RESP_CODE: $(api_error)"
+  local final="$RESP_BODY" deleted
+  deleted="$(jq -r '.pruned | length' <<<"$final")"
+
+  echo "created $created, updated $updated, renamed $renamed, deleted $deleted, pending $n_pending, unchanged $unchanged"
+
+  # Anything still missing, stale or pending means the KB does not match.
+  local problems
+  problems="$(jq -r --arg prune "$prune" '
+    (.missing | map("  missing  " + .)[]),
+    (.stale | map("  failed   " + .)[]),
+    (.pending | map("  indexing " + .)[]),
+    (if $prune == "true" then ((.extra - .pruned) | map("  extra    " + .)[]) else empty end)
+  ' <<<"$final")"
+
+  if [[ -n "$problems" || "$errors" -gt 0 ]]; then
+    [[ -z "$problems" ]] || printf '%s\n' "$problems" >&2
+    # Name the indexing errors the KB recorded, if any.
+    curl -sS "$KB_URL/api/collections/$collection" |
+      jq -r '.failed[]? | "  error    \(.key): \(.error)"' >&2 || true
+    die "sync incomplete: the collection does not match the files yet"
+  fi
+
+  if [[ "$prune" == "true" ]]; then
+    echo "✓ '$collection' matches $total files"
+  else
+    echo "✓ all $total files are in '$collection' ($(jq -r '.extra | length' <<<"$final") other documents kept)"
+  fi
+}
+
+# Print a document's stored text exactly: jq -j adds no trailing newline, so
+# the output compares byte for byte with the file it came from.
+cmd_doc() {
+  local collection="" key="" section=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --section) section="${2:?--section needs a value}"; shift 2 ;;
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (try '$PROG help')" ;;
+      *)
+        if [[ -z "$collection" ]]; then collection="$1"
+        elif [[ -z "$key" ]]; then key="$1"
+        else die "unexpected extra argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "$key" && $# -gt 0 ]]; then key="$1"; shift; fi
+  [[ $# -eq 0 ]] || die "unexpected extra argument: $1"
+
+  [[ -n "$collection" && -n "$key" ]] || die "doc: missing <collection> <key> (try '$PROG help')"
+
+  local body code
+  body="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$body'" RETURN
+
+  code="$(curl -sS -o "$body" -w '%{http_code}' -G \
+    --data-urlencode "key=$key" \
+    ${section:+--data-urlencode "section=$section"} \
+    "$KB_URL/api/collections/$collection/documents")" ||
+    die "request failed (is KB reachable at $KB_URL?)"
+
+  [[ "$code" == "200" ]] ||
+    die "server returned HTTP $code: $(jq -r '.error // empty' "$body" 2>/dev/null || cat "$body")"
+
+  jq -j '.content' "$body"
+}
+
+# Backlinks and outlinks for one page, or the collection's link report.
+cmd_links() {
+  local collection="" key="" report="false" raw="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --report) report="true"; shift ;;
+      --json) raw="true"; shift ;;
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      -*) die "unknown option: $1 (try '$PROG help')" ;;
+      *)
+        if [[ -z "$collection" ]]; then collection="$1"
+        elif [[ -z "$key" ]]; then key="$1"
+        else die "unexpected extra argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$collection" ]] || die "links: missing <collection> (try '$PROG help')"
+  [[ "$report" == "true" || -n "$key" ]] || die "links: pass <key> or --report"
+
+  local resp code body
+  if [[ "$report" == "true" ]]; then
+    resp="$(curl -sS -w $'\n%{http_code}' "$KB_URL/api/collections/$collection/link_report")"
+  else
+    resp="$(curl -sS -w $'\n%{http_code}' -G --data-urlencode "key=$key" "$KB_URL/api/collections/$collection/links")"
+  fi || die "request failed (is KB reachable at $KB_URL?)"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+
+  [[ "$code" == "200" ]] ||
+    die "server returned HTTP $code: $(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null || printf '%s' "$body")"
+
+  if [[ "$raw" == "true" ]]; then
+    printf '%s' "$body" | jq .
+  elif [[ "$report" == "true" ]]; then
+    printf '%s' "$body" | jq -r '
+      "\(.collection): \(.counts.documents) documents, \(.counts.links) links, \(.counts.broken) broken, \(.counts.orphans) orphans, \(.counts.ambiguous) ambiguous slugs",
+      (if (.broken | length) > 0 then "", "Broken:", (.broken[] | "  \(.key) -> [[\(.target)]]\(if .count > 1 then " ×\(.count)" else "" end)") else empty end),
+      (if (.orphans | length) > 0 then "", "Orphans:", (.orphans[] | "  \(.key)") else empty end),
+      (if (.ambiguous | length) > 0 then "", "Ambiguous:", (.ambiguous[] | "  [[\(.slug)]] -> \(.keys | join(", "))") else empty end)'
+  else
+    printf '%s' "$body" | jq -r '
+      "\(.document.key)  ([[\(.slug)]])",
+      "",
+      "Backlinks (\(.backlinks | length)):",
+      (.backlinks[] | "  \(.key)\(if .count > 1 then " ×\(.count)" else "" end)"),
+      "",
+      "Outlinks (\(.outlinks | length)):",
+      (.outlinks[] | "  [[\(.target)\(if .heading then "#" + .heading else "" end)]] \(if .status == "ok" then "-> " + .documents[0].key else .status end)")'
+  fi
+}
+
+# Context notes: list a collection's, or set or clear one.
+cmd_context() {
+  local collection="" prefix="" description="" nargs=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      *)
+        case "$nargs" in
+          0) collection="$1" ;;
+          1) prefix="$1" ;;
+          2) description="$1" ;;
+          *) die "unexpected extra argument: $1" ;;
+        esac
+        nargs=$((nargs + 1))
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$collection" ]] || die "context: missing <collection> (try '$PROG help')"
+  ((nargs != 2)) || die "context: pass a description, or \"\" to clear the note"
+
+  local resp code body
+  if ((nargs == 1)); then
+    resp="$(curl -sS -w $'\n%{http_code}' "$KB_URL/api/collections/$collection/contexts")"
+  else
+    resp="$(curl -sS -w $'\n%{http_code}' -X PUT -H 'Content-Type: application/json' \
+      -d "$(jq -cn --arg p "$prefix" --arg d "$description" '{prefix: $p, description: $d}')" \
+      "$KB_URL/api/collections/$collection/contexts")"
+  fi || die "request failed (is KB reachable at $KB_URL?)"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+
+  [[ "$code" == "200" ]] ||
+    die "server returned HTTP $code: $(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null || printf '%s' "$body")"
+
+  if ((nargs == 1)); then
+    printf '%s' "$body" | jq -r '.contexts[] | "\(if .prefix == "" then "(collection)" else .prefix end)\t\(.description)"'
+  elif [[ -z "$description" ]]; then
+    echo "cleared: $collection ${prefix:-(collection)}"
+  else
+    echo "set: $collection ${prefix:-(collection)}"
+  fi
+}
+
+# Sends a request and leaves the body in RESP_BODY, or dies with the server's
+# error. Usage: request METHOD PATH [JSON_BODY]
+request() {
+  local method="$1" path="$2" data="${3:-}" out code
+  if [[ -n "$data" ]]; then
+    out="$(printf '%s' "$data" | curl -sS -w $'\n%{http_code}' -X "$method" \
+      -H 'Content-Type: application/json' --data-binary @- "$KB_URL$path")"
+  else
+    out="$(curl -sS -w $'\n%{http_code}' -X "$method" "$KB_URL$path")"
+  fi || die "request failed (is KB reachable at $KB_URL?)"
+  code="${out##*$'\n'}"
+  RESP_BODY="${out%$'\n'*}"
+  [[ "$code" == 2* ]] ||
+    die "server returned HTTP $code: $(printf '%s' "$RESP_BODY" | jq -r '.error // empty' 2>/dev/null || printf '%s' "$RESP_BODY")"
+}
+
+# Takes the common --url and --json flags and collects the rest as
+# positional arguments in ARGS.
+parse_simple() {
+  RAW="false"
+  ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) RAW="true"; shift ;;
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; exit 0 ;;
+      -*) die "unknown option: $1 (try '$PROG help')" ;;
+      *) ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+# Lists collections, or shows one collection's status.
+cmd_collection() {
+  parse_simple "$@"
+  ((${#ARGS[@]} <= 1)) || die "collection: takes at most one <name>"
+
+  if ((${#ARGS[@]} == 0)); then
+    request GET /api/collections
+    [[ "$RAW" == "true" ]] && { printf '%s' "$RESP_BODY" | jq .; return 0; }
+    printf '%s' "$RESP_BODY" | jq -r '.collections[] | "\(.name)\t\(.documents) documents"'
+    return 0
+  fi
+
+  request GET "/api/collections/${ARGS[0]}"
+  [[ "$RAW" == "true" ]] && { printf '%s' "$RESP_BODY" | jq .; return 0; }
+  printf '%s' "$RESP_BODY" | jq -r '
+    def kv: to_entries | map("\(.key) \(.value)") | join(", ");
+    "\(.collection): \(.documents) documents, \(.chunks) chunks",
+    "  status:      \(if (.by_status | length) > 0 then .by_status | kv else "—" end)",
+    "  pending:     \(.pending)",
+    "  last change: \(.last_changed_at // "—")",
+    "  last sync:   \(.last_synced_at // "never")",
+    (if (.contexts | length) > 0 then "  context:", (.contexts[] | "    \(if .prefix == "" then "(collection)" else .prefix end)  \(.description)") else empty end),
+    (if (.failed | length) > 0 then "  failed:", (.failed[] | "    \(.key // .title): \(.error)") else empty end)'
+}
+
+# Sources closest in meaning to a source, by id or by collection and key.
+cmd_related() {
+  local target="" limit="" raw="false"
+  local -a args=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c | --collection) target="${2:?--collection needs a value}"; shift 2 ;;
+      -l | --limit) limit="${2:?--limit needs a value}"; shift 2 ;;
+      --json) raw="true"; shift ;;
+      --url) KB_URL="${2:?--url needs a value}"; KB_URL="${KB_URL%/}"; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      -*) die "unknown option: $1 (try '$PROG help')" ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+
+  local id title
+  case "${#args[@]}" in
+    1)
+      id="${args[0]}"
+      request GET "/api/sources/$id"
+      title="$(printf '%s' "$RESP_BODY" | jq -r '.title')"
+      ;;
+    2)
+      request POST "/api/collections/${args[0]}/documents/get" \
+        "$(jq -cn --arg k "${args[1]}" '{keys: [$k], include_content: false}')"
+      id="$(printf '%s' "$RESP_BODY" | jq -r '.documents[0].id // empty')"
+      [[ -n "$id" ]] || die "no document at ${args[1]} in ${args[0]}"
+      title="$(printf '%s' "$RESP_BODY" | jq -r '.documents[0].title')"
+      ;;
+    *) die "related: pass <id>, or <collection> <key> (try '$PROG help')" ;;
+  esac
+
+  local query=""
+  [[ -n "$target" ]] && query+="collection=$(jq -rn --arg v "$target" '$v | @uri')&"
+  [[ -n "$limit" ]] && query+="limit=$limit"
+  request GET "/api/sources/$id/related?${query%&}"
+
+  if [[ "$raw" == "true" ]]; then
+    printf '%s' "$RESP_BODY" | jq .
+    return 0
+  fi
+
+  printf '%s' "$RESP_BODY" | jq -r --arg title "$title" --arg target "$target" '
+    "Related to: \($title)\(if $target != "" then "  (in \($target))" else "" end)",
+    "",
+    (.related[] |
+      "[\(.avg_similarity)]  \(.title)  ·  \(.collection)\(if .key then ":" + .key else "" end)",
+      (if .url then "        \(.url)" else empty end))'
+}
+
+cmd_reindex() {
+  parse_simple "$@"
+  ((${#ARGS[@]} == 1)) || die "reindex: missing <collection> (try '$PROG help')"
+  request POST "/api/collections/${ARGS[0]}/reindex"
+  [[ "$RAW" == "true" ]] && { printf '%s' "$RESP_BODY" | jq .; return 0; }
+  printf 'queued %s document(s) in %s; each keeps serving its current text until the new version swaps in\n' \
+    "$(printf '%s' "$RESP_BODY" | jq -r '.queued')" "${ARGS[0]}"
+  printf 'watch it with: %s collection %s\n' "$PROG" "${ARGS[0]}"
+}
+
+cmd_relink() {
+  parse_simple "$@"
+  ((${#ARGS[@]} == 1)) || die "relink: missing <collection> (try '$PROG help')"
+  request POST "/api/collections/${ARGS[0]}/relink"
+  [[ "$RAW" == "true" ]] && { printf '%s' "$RESP_BODY" | jq .; return 0; }
+  printf 'relinked %s document(s) in %s\n' "$(printf '%s' "$RESP_BODY" | jq -r '.relinked')" "${ARGS[0]}"
+}
+
+cmd_health() {
+  curl -sS "$KB_URL/health" | jq .
+}
+
+main() {
+  need curl
+  need jq
+
+  case "${1:-help}" in
+    ingest) shift; cmd_ingest "$@" ;;
+    search) shift; cmd_search "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    content) shift; cmd_content "$@" ;;
+    rename) shift; cmd_rename "$@" ;;
+    meta) shift; cmd_meta "$@" ;;
+    stats) shift; cmd_stats "$@" ;;
+    sync) shift; cmd_sync "$@" ;;
+    doc) shift; cmd_doc "$@" ;;
+    links) shift; cmd_links "$@" ;;
+    context) shift; cmd_context "$@" ;;
+    collection | collections) shift; cmd_collection "$@" ;;
+    related) shift; cmd_related "$@" ;;
+    reindex) shift; cmd_reindex "$@" ;;
+    relink) shift; cmd_relink "$@" ;;
+    health) shift; cmd_health ;;
+    help | -h | --help) usage ;;
+    *) die "unknown command: $1 (try '$PROG help')" ;;
+  esac
+}
+
+main "$@"
