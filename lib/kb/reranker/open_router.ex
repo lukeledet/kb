@@ -50,7 +50,7 @@ defmodule KB.Reranker.OpenRouter do
         json: body,
         headers: [{"authorization", "Bearer #{api_key()}"}],
         receive_timeout: timeout,
-        pool_timeout: timeout,
+        finch: [pool_timeout: timeout],
         retry: false
       ]
       |> then(fn req_opts ->
