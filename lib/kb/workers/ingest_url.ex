@@ -2,21 +2,32 @@ defmodule KB.Workers.IngestUrl do
   use Oban.Worker, queue: :ingestion, max_attempts: 5
 
   alias KB.Sources
-  alias KB.Parsers.Html
+  alias KB.Parsers.{Html, Pdf}
   alias KB.Tagger
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: args}) do
     case Sources.get_source(args["source_id"]) do
       nil -> {:cancel, :source_deleted}
-      source -> ingest(source)
+      source -> run(source)
     end
+  end
+
+  # A raise, such as a database error inside the insert, would skip the
+  # failure handling in ingest/1 and leave the source "processing" for good.
+  # Record it, then re-raise so Oban keeps the stacktrace and still retries.
+  defp run(source) do
+    ingest(source)
+  rescue
+    exception ->
+      Sources.mark_failed(source.id, Exception.message(exception))
+      reraise exception, __STACKTRACE__
   end
 
   defp ingest(source) do
     with {:ok, source} <- Sources.update_source_if_present(source, %{status: "processing"}),
-         {:ok, html} <- fetch_url(source.url),
-         {:ok, parsed} <- Html.parse(html),
+         {:ok, body, content_type} <- fetch_url(source.url),
+         {:ok, parsed} <- parse_page(body, content_type),
          content_hash <- hash_content(parsed.text),
          {:ok, source} <- save_page(source, parsed, content_hash),
          source <- Tagger.maybe_auto_tag(source, parsed.text),
@@ -39,19 +50,11 @@ defmodule KB.Workers.IngestUrl do
       # Another source already holds this exact text. Retrying fetches the same
       # page and hits the same clash, so record why and stop.
       {:error, {:duplicate_content, content_hash}} ->
-        Sources.update_source_if_present(source, %{
-          status: "failed",
-          error: duplicate_error(content_hash)
-        })
-
+        Sources.mark_failed(source.id, duplicate_error(content_hash))
         {:cancel, :duplicate_content}
 
       {:error, reason} ->
-        Sources.update_source_if_present(source, %{
-          status: "failed",
-          error: inspect(reason)
-        })
-
+        Sources.mark_failed(source.id, inspect(reason))
         {:error, reason}
     end
   end
@@ -66,14 +69,38 @@ defmodule KB.Workers.IngestUrl do
       end
 
     case Req.get(req_opts) do
-      {:ok, %Req.Response{status: 200, body: body}} when is_binary(body) ->
-        {:ok, body}
+      {:ok, %Req.Response{status: 200, body: body} = response} when is_binary(body) ->
+        {:ok, body, List.first(Req.Response.get_header(response, "content-type"), "")}
 
       {:ok, %Req.Response{status: status}} ->
         {:error, {:http_error, status}}
 
       {:error, exception} ->
         {:error, {:request_failed, exception}}
+    end
+  end
+
+  # A URL can point at a PDF as well as a web page. Trust the file signature
+  # over the header, since servers often send PDFs as application/octet-stream.
+  defp parse_page(body, content_type) do
+    if Pdf.pdf?(body) or String.starts_with?(content_type, "application/pdf") do
+      parse_pdf(body)
+    else
+      parse_html(body)
+    end
+  end
+
+  defp parse_pdf(body) do
+    case Pdf.parse(body) do
+      {:ok, text} -> {:ok, %{title: nil, text: KB.Text.sanitize(text)}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse_html(body) do
+    case Html.parse(body) do
+      {:ok, parsed} -> {:ok, %{parsed | text: KB.Text.sanitize(parsed.text)}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -117,7 +144,7 @@ defmodule KB.Workers.IngestUrl do
   defp clean(nil), do: nil
 
   defp clean(value) when is_binary(value) do
-    case String.trim(value) do
+    case value |> KB.Text.sanitize() |> String.trim() do
       "" -> nil
       trimmed -> trimmed
     end

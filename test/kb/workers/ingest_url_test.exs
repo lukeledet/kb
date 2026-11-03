@@ -160,6 +160,58 @@ defmodule KB.Workers.IngestUrlTest do
       assert updated.error =~ first.id
     end
 
+    test "ingests a PDF served from a URL" do
+      Req.Test.stub(IngestUrl, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/pdf")
+        |> Plug.Conn.send_resp(200, File.read!("test/fixtures/sample.pdf"))
+      end)
+
+      url = "https://example.com/paper.pdf"
+      {:ok, source} = Sources.create_source(%{title: "Paper", source_type: "url", url: url})
+
+      assert :ok = IngestUrl.perform(%Oban.Job{args: %{"source_id" => source.id}})
+
+      updated = Sources.get_source!(source.id)
+      assert updated.status == "completed"
+      assert updated.title == "Paper"
+      document = KB.Repo.get!(Arcana.Document, updated.arcana_document_id)
+      assert document.content =~ "Sample PDF text for ingestion tests."
+    end
+
+    test "detects a PDF by its signature when the server sends a generic type" do
+      Req.Test.stub(IngestUrl, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/octet-stream")
+        |> Plug.Conn.send_resp(200, File.read!("test/fixtures/sample.pdf"))
+      end)
+
+      url = "https://example.com/download"
+      {:ok, source} = Sources.create_source(%{title: url, source_type: "url", url: url})
+
+      assert :ok = IngestUrl.perform(%Oban.Job{args: %{"source_id" => source.id}})
+      assert Sources.get_source!(source.id).status == "completed"
+    end
+
+    test "strips NUL bytes from page text" do
+      Req.Test.stub(IngestUrl, fn conn ->
+        Req.Test.html(
+          conn,
+          "<html><body><article><p>Page with a NUL\u0000 byte.</p></article></body></html>"
+        )
+      end)
+
+      url = "https://example.com/nul"
+      {:ok, source} = Sources.create_source(%{title: url, source_type: "url", url: url})
+
+      assert :ok = IngestUrl.perform(%Oban.Job{args: %{"source_id" => source.id}})
+
+      updated = Sources.get_source!(source.id)
+      assert updated.status == "completed"
+      document = KB.Repo.get!(Arcana.Document, updated.arcana_document_id)
+      refute String.contains?(document.content, <<0>>)
+    end
+
     test "sets source to failed on HTTP error" do
       Req.Test.stub(IngestUrl, fn conn ->
         Plug.Conn.send_resp(conn, 404, "Not Found")

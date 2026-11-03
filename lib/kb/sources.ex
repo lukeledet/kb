@@ -56,6 +56,23 @@ defmodule KB.Sources do
   end
 
   @doc """
+  Sets a source's status to "failed" and records `error`.
+
+  Writes by id rather than through a changeset. An ingest worker holds the
+  source as it was loaded, which on a retry is already "failed" with the same
+  error. A changeset against that struct sees no change and writes nothing,
+  so the row would stay "processing". Does nothing if the source is gone.
+  """
+  def mark_failed(source_id, error) when is_binary(error) do
+    from(s in Source, where: s.id == ^source_id)
+    |> Repo.update_all(
+      set: [status: "failed", error: error, updated_at: DateTime.utc_now(:second)]
+    )
+
+    :ok
+  end
+
+  @doc """
   True when a source's title is still the stand-in chosen at creation time —
   the uploaded filename, the URL itself, or "Untitled" — rather than one the
   caller picked.

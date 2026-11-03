@@ -2,7 +2,7 @@ defmodule KB.Workers.IngestContent do
   use Oban.Worker, queue: :ingestion, max_attempts: 5
 
   alias KB.Sources
-  alias KB.Parsers.Epub
+  alias KB.Parsers.{Epub, Pdf}
   alias KB.Tagger
 
   @impl Oban.Worker
@@ -13,14 +13,27 @@ defmodule KB.Workers.IngestContent do
         {:cancel, :source_deleted}
 
       source ->
-        ingest(source, temp_path)
+        run(source, temp_path)
     end
+  end
+
+  # A raise, such as a database error inside the insert, would skip the
+  # failure handling in ingest/2 and leave the source "processing" for good.
+  # Record it, then re-raise so Oban keeps the stacktrace and still retries.
+  # The temp file stays for the retry.
+  defp run(source, temp_path) do
+    ingest(source, temp_path)
+  rescue
+    exception ->
+      Sources.mark_failed(source.id, Exception.message(exception))
+      reraise exception, __STACKTRACE__
   end
 
   defp ingest(source, temp_path) do
     with {:ok, source} <- Sources.update_source_if_present(source, %{status: "processing"}),
          {:ok, content} <- read_temp_file(temp_path),
          {:ok, text, parsed} <- parse_content(content, source.source_type),
+         text = KB.Text.sanitize(text),
          {:ok, source} <- apply_parsed_metadata(source, parsed),
          source <- Tagger.maybe_auto_tag(source, text),
          {:ok, document} <- ingest_text(text, source),
@@ -42,11 +55,7 @@ defmodule KB.Workers.IngestContent do
         {:cancel, :source_deleted}
 
       {:error, reason} ->
-        Sources.update_source_if_present(source, %{
-          status: "failed",
-          error: inspect(reason)
-        })
-
+        Sources.mark_failed(source.id, inspect(reason))
         {:error, reason}
     end
   end
@@ -79,21 +88,9 @@ defmodule KB.Workers.IngestContent do
   end
 
   defp parse_content(content, "pdf") do
-    tmp_pdf =
-      Path.join(
-        System.tmp_dir!(),
-        "kb_pdf_#{:crypto.strong_rand_bytes(8) |> Base.encode16()}.pdf"
-      )
-
-    try do
-      File.write!(tmp_pdf, content)
-
-      case Arcana.Parser.parse(tmp_pdf) do
-        {:ok, text} -> {:ok, text, %{}}
-        {:error, reason} -> {:error, reason}
-      end
-    after
-      File.rm(tmp_pdf)
+    case Pdf.parse(content) do
+      {:ok, text} -> {:ok, text, %{}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -146,7 +143,7 @@ defmodule KB.Workers.IngestContent do
   defp clean(nil), do: nil
 
   defp clean(value) when is_binary(value) do
-    case String.trim(value) do
+    case value |> KB.Text.sanitize() |> String.trim() do
       "" -> nil
       trimmed -> trimmed
     end

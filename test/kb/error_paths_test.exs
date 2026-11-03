@@ -47,6 +47,73 @@ defmodule KB.ErrorPathsTest do
     end
   end
 
+  defmodule RaisingEmbedder do
+    @behaviour Arcana.Embedder
+    def embed(_text, _opts \\ []), do: raise("embedder exploded")
+    def embed_batch(_texts, _opts \\ []), do: raise("embedder exploded")
+    def dimensions(_opts \\ []), do: 4096
+  end
+
+  describe "a raise inside an ingest worker" do
+    setup do
+      prev = Application.get_env(:arcana, :embedder)
+      Application.put_env(:arcana, :embedder, RaisingEmbedder)
+      on_exit(fn -> Application.put_env(:arcana, :embedder, prev) end)
+    end
+
+    test "IngestContent marks the source failed and re-raises" do
+      {:ok, source} = Sources.create_source(%{title: "Crash", source_type: "text"})
+      temp_path = write_temp("Some text to ingest.", ".bin")
+      on_exit(fn -> cleanup(temp_path) end)
+
+      job = %Oban.Job{args: %{"source_id" => source.id, "temp_path" => temp_path}}
+      assert_raise RuntimeError, "embedder exploded", fn -> IngestContent.perform(job) end
+
+      updated = Sources.get_source!(source.id)
+      assert updated.status == "failed"
+      assert updated.error == "embedder exploded"
+      # The retry needs the file.
+      assert File.exists?(temp_path)
+    end
+
+    test "IngestContent marks a retry failed again, not left processing" do
+      {:ok, source} =
+        Sources.create_source(%{
+          title: "Crash",
+          source_type: "text",
+          status: "failed",
+          error: "embedder exploded"
+        })
+
+      temp_path = write_temp("Some text to ingest.", ".bin")
+      on_exit(fn -> cleanup(temp_path) end)
+
+      job = %Oban.Job{args: %{"source_id" => source.id, "temp_path" => temp_path}}
+      assert_raise RuntimeError, fn -> IngestContent.perform(job) end
+
+      assert Sources.get_source!(source.id).status == "failed"
+    end
+
+    test "IngestUrl marks the source failed and re-raises" do
+      Req.Test.stub(IngestUrl, fn conn ->
+        Req.Test.html(conn, "<html><body><article><p>Some page text.</p></article></body></html>")
+      end)
+
+      Application.put_env(:kb, :req_options, plug: {Req.Test, IngestUrl}, retry: false)
+      on_exit(fn -> Application.delete_env(:kb, :req_options) end)
+
+      url = "https://example.com/crash"
+      {:ok, source} = Sources.create_source(%{title: url, source_type: "url", url: url})
+
+      job = %Oban.Job{args: %{"source_id" => source.id}}
+      assert_raise RuntimeError, "embedder exploded", fn -> IngestUrl.perform(job) end
+
+      updated = Sources.get_source!(source.id)
+      assert updated.status == "failed"
+      assert updated.error == "embedder exploded"
+    end
+  end
+
   describe "HTTP API error paths" do
     test "POST /api/ingest/text with empty text string returns 400" do
       conn =

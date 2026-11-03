@@ -73,6 +73,42 @@ defmodule KB.Workers.IngestContentTest do
       refute File.exists?(temp_path)
     end
 
+    test "strips NUL bytes from text so the source completes" do
+      text = "Text with a NUL\u0000 byte and a \u0001 control character."
+      {:ok, source} = Sources.create_source(%{title: "NUL", source_type: "text"})
+
+      temp_path = IngestContent.temp_path(source.id)
+      File.write!(temp_path, text)
+      on_exit(fn -> File.rm(temp_path) end)
+
+      job = %Oban.Job{args: %{"source_id" => source.id, "temp_path" => temp_path}}
+      assert :ok = IngestContent.perform(job)
+
+      updated = Sources.get_source!(source.id)
+      assert updated.status == "completed"
+      assert updated.chunk_count > 0
+
+      document = KB.Repo.get!(Arcana.Document, updated.arcana_document_id)
+      assert document.content == "Text with a NUL byte and a  control character."
+    end
+
+    test "ingests a PDF" do
+      pdf = File.read!("test/fixtures/sample.pdf")
+      {:ok, source} = Sources.create_source(%{title: "sample.pdf", source_type: "pdf"})
+
+      temp_path = IngestContent.temp_path(source.id)
+      File.write!(temp_path, pdf)
+      on_exit(fn -> File.rm(temp_path) end)
+
+      job = %Oban.Job{args: %{"source_id" => source.id, "temp_path" => temp_path}}
+      assert :ok = IngestContent.perform(job)
+
+      updated = Sources.get_source!(source.id)
+      assert updated.status == "completed"
+      document = KB.Repo.get!(Arcana.Document, updated.arcana_document_id)
+      assert document.content =~ "Sample PDF text for ingestion tests."
+    end
+
     test "sets source to failed when temp file is missing" do
       {:ok, source} =
         Sources.create_source(%{
